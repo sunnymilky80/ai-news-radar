@@ -40,6 +40,35 @@ WAYTOAGI_DEFAULT = (
 )
 WAYTOAGI_HISTORY_FALLBACK = "https://waytoagi.feishu.cn/wiki/FjiOwWp2giA7hRk6jjfcPioCnAc"
 
+RSS_FEED_REPLACEMENTS: dict[str, str] = {
+    "https://rsshub.app/infoq/recommend": "https://www.infoq.cn/feed",
+    "https://rsshub.app/huggingface/blog-zh": "https://huggingface.co/blog/feed.xml",
+    "https://rsshub.app/readhub/daily": "https://readhub.cn/rss",
+    "https://rsshub.app/36kr/hot-list": "https://36kr.com/feed",
+    "https://rsshub.app/sspai/index": "https://sspai.com/feed",
+    "https://rsshub.app/sspai/matrix": "https://sspai.com/feed",
+    "https://rsshub.app/meituan/tech": "https://tech.meituan.com/feed",
+    "https://mjg59.dreamwidth.org/data/rss": "http://mjg59.dreamwidth.org/data/rss",
+}
+
+RSS_FEED_SKIP_PREFIXES: tuple[str, ...] = (
+    "https://rsshub.app/telegram/channel/",
+    "https://rsshub.app/jike/",
+    "https://rsshub.app/bilibili/",
+    "https://rsshub.app/zhihu/",
+    "https://rsshub.app/xiaoyuzhou/podcast/",
+    "https://rsshub.app/xyzrank",
+    "https://rsshub.app/mittrchina/hot",
+    "https://wechat2rss.bestblogs.dev/",
+    "https://werss.bestblogs.dev/",
+    "http://47.122.94.119:18080/",
+)
+
+RSS_FEED_SKIP_EXACT: set[str] = {
+    "https://rachelbythebay.com/w/atom.xml",
+    "https://flak.tedunangst.com/rss",
+}
+
 
 @dataclass
 class RawItem:
@@ -1472,6 +1501,21 @@ def parse_opml_subscriptions(opml_path: Path) -> list[dict[str, str]]:
     return out
 
 
+def resolve_official_rss_url(feed_url: str) -> tuple[str | None, str | None]:
+    src = (feed_url or "").strip()
+    if not src:
+        return None, "empty_url"
+    if src in RSS_FEED_SKIP_EXACT:
+        return None, "no_official_rss_or_unreachable"
+    for prefix in RSS_FEED_SKIP_PREFIXES:
+        if src.startswith(prefix):
+            return None, "no_official_rss_for_source_type"
+    replaced = RSS_FEED_REPLACEMENTS.get(src)
+    if replaced:
+        return replaced, "official_replacement"
+    return src, None
+
+
 def fetch_opml_rss(
     now: datetime,
     opml_path: Path,
@@ -1483,9 +1527,39 @@ def fetch_opml_rss(
 
     out: list[RawItem] = []
     feed_statuses: list[dict[str, Any]] = []
+    resolved_feeds: list[dict[str, str]] = []
+
+    for feed in feeds:
+        original_url = feed["xml_url"]
+        resolved_url, skip_reason = resolve_official_rss_url(original_url)
+        if not resolved_url:
+            feed_id = hashlib.sha1(original_url.encode("utf-8")).hexdigest()[:10]
+            feed_statuses.append(
+                {
+                    "site_id": f"opmlrss:{feed_id}",
+                    "site_name": "OPML RSS",
+                    "feed_title": feed["title"],
+                    "feed_url": original_url,
+                    "effective_feed_url": None,
+                    "ok": True,
+                    "item_count": 0,
+                    "duration_ms": 0,
+                    "error": None,
+                    "skipped": True,
+                    "skip_reason": skip_reason or "skipped",
+                    "replaced": False,
+                }
+            )
+            continue
+        record = dict(feed)
+        record["xml_url_original"] = original_url
+        record["xml_url"] = resolved_url
+        record["replaced"] = bool(resolved_url != original_url)
+        resolved_feeds.append(record)
 
     def fetch_single_feed(feed: dict[str, str]) -> tuple[list[RawItem], dict[str, Any]]:
         feed_url = feed["xml_url"]
+        original_feed_url = str(feed.get("xml_url_original") or feed_url)
         feed_title = feed["title"]
         feed_id = hashlib.sha1(feed_url.encode("utf-8")).hexdigest()[:10]
         start = time.perf_counter()
@@ -1566,26 +1640,33 @@ def fetch_opml_rss(
             "site_id": f"opmlrss:{feed_id}",
             "site_name": "OPML RSS",
             "feed_title": feed_title,
-            "feed_url": feed_url,
+            "feed_url": original_feed_url,
+            "effective_feed_url": feed_url,
             "ok": error is None,
             "item_count": len(local_items),
             "duration_ms": duration_ms,
             "error": error,
+            "skipped": False,
+            "skip_reason": None,
+            "replaced": bool(original_feed_url != feed_url),
         }
         return local_items, status
 
-    worker_count = min(20, max(4, len(feeds)))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(fetch_single_feed, feed) for feed in feeds]
-        for future in as_completed(futures):
-            items, status = future.result()
-            out.extend(items)
-            feed_statuses.append(status)
+    if resolved_feeds:
+        worker_count = min(20, max(4, len(resolved_feeds)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(fetch_single_feed, feed) for feed in resolved_feeds]
+            for future in as_completed(futures):
+                items, status = future.result()
+                out.extend(items)
+                feed_statuses.append(status)
 
     feed_statuses.sort(key=lambda x: str(x.get("feed_title") or x.get("feed_url") or ""))
     total_duration_ms = sum(int(s.get("duration_ms") or 0) for s in feed_statuses)
     ok_feeds = sum(1 for s in feed_statuses if s["ok"])
     failed_feeds = sum(1 for s in feed_statuses if not s["ok"])
+    skipped_feeds = sum(1 for s in feed_statuses if s.get("skipped"))
+    replaced_feeds = sum(1 for s in feed_statuses if s.get("replaced"))
 
     summary_status = {
         "site_id": "opmlrss",
@@ -1596,8 +1677,11 @@ def fetch_opml_rss(
         "duration_ms": total_duration_ms,
         "error": None if failed_feeds == 0 else f"{failed_feeds} feeds failed",
         "feed_count": len(feeds),
+        "effective_feed_count": len(resolved_feeds),
         "ok_feed_count": ok_feeds,
         "failed_feed_count": failed_feeds,
+        "skipped_feed_count": skipped_feeds,
+        "replaced_feed_count": replaced_feeds,
     }
     return out, summary_status, feed_statuses
 
@@ -2155,9 +2239,24 @@ def main() -> int:
             "enabled": bool(args.rss_opml),
             "path": str(Path(args.rss_opml).expanduser()) if args.rss_opml else None,
             "feed_total": len(rss_feed_statuses),
-            "ok_feeds": sum(1 for s in rss_feed_statuses if s["ok"]),
-            "failed_feeds": [s["feed_url"] for s in rss_feed_statuses if not s["ok"]],
-            "zero_item_feeds": [s["feed_url"] for s in rss_feed_statuses if s["ok"] and int(s.get("item_count") or 0) == 0],
+            "effective_feed_total": sum(1 for s in rss_feed_statuses if not s.get("skipped")),
+            "ok_feeds": sum(1 for s in rss_feed_statuses if s["ok"] and not s.get("skipped")),
+            "failed_feeds": [s.get("effective_feed_url") or s["feed_url"] for s in rss_feed_statuses if not s["ok"]],
+            "zero_item_feeds": [
+                s.get("effective_feed_url") or s["feed_url"]
+                for s in rss_feed_statuses
+                if s["ok"] and not s.get("skipped") and int(s.get("item_count") or 0) == 0
+            ],
+            "skipped_feeds": [
+                {"feed_url": s["feed_url"], "reason": s.get("skip_reason")}
+                for s in rss_feed_statuses
+                if s.get("skipped")
+            ],
+            "replaced_feeds": [
+                {"from": s["feed_url"], "to": s.get("effective_feed_url")}
+                for s in rss_feed_statuses
+                if s.get("replaced") and s.get("effective_feed_url")
+            ],
             "feeds": rss_feed_statuses,
         },
     }
